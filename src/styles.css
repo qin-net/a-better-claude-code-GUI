@@ -313,10 +313,49 @@ input, textarea, select { font: inherit; color: inherit; }
 .workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 520px;
+  /* the actual columns come from App's layout state as an inline style;
+     this is only the pre-hydration fallback */
+  grid-template-columns: 248px 5px minmax(0, 1fr) 5px 520px;
   min-height: 0;
 }
 .workspace > * { min-width: 0; min-height: 0; }
+
+/* pane visibility — display:none removes the element from the grid, and the
+   inline grid-template-columns only lists visible panes */
+.workspace[data-hide-sidebar] .sidebar { display: none; }
+.workspace[data-hide-editor] .center { display: none; }
+.workspace[data-hide-chat] .chat { display: none; }
+
+/* drag handle between panes; the pane borders draw the resting 1px line, the
+   handle lights up on hover/drag */
+.pane-divider {
+  cursor: col-resize;
+  position: relative;
+  z-index: 6;
+  /* widen the hit area beyond the 5px track */
+  margin: 0 -3px;
+  padding: 0 3px;
+}
+.pane-divider::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  transform: translateX(-50%);
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.12s;
+}
+.pane-divider:hover::after,
+.workspace.is-resizing .pane-divider::after { background: var(--accent); }
+.workspace.is-resizing { user-select: none; cursor: col-resize; }
+
+.layout-toggles { display: flex; gap: 2px; }
+.pane-toggle { display: flex; align-items: center; padding: 4px 6px; color: var(--text-faint); }
+.pane-toggle[data-active='true'] { color: var(--text-dim); }
+.pane-toggle:hover { color: var(--accent); }
 
 /* ------------------------------------------------------------------- sidebar */
 
@@ -999,7 +1038,3 @@ input, textarea, select { font: inherit; color: inherit; }
 .stop-btn { display: flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 5px; border: 1px solid rgba(248, 81, 73, 0.5); color: #ffa198; font-size: 12px; }
 .stop-btn:hover { background: rgba(248, 81, 73, 0.12); }
 .stop-square { width: 9px; height: 9px; background: #ffa198; border-radius: 1px; }
-
-@media (max-width: 1180px) {
-  .workspace { grid-template-columns: 220px minmax(0, 1fr) 420px; }
-}

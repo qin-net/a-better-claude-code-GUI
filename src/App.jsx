@@ -8,6 +8,38 @@ import { useI18n } from './lib/i18n.jsx'
 const LS_FOLDER = 'ccgui.lastFolder'
 const LS_MODEL = 'ccgui.model'
 const LS_MODE = 'ccgui.permissionMode'
+const LS_LAYOUT = 'ccgui.layout'
+
+const DEFAULT_LAYOUT = { sidebar: true, editor: true, chat: true, sidebarW: 248, chatW: 520 }
+// px bounds a divider can drag a pane to
+const PANE_BOUNDS = { sidebarW: [170, 560], chatW: [300, 860] }
+
+/**
+ * The workspace grid is built from whichever panes are visible. Exactly one
+ * visible pane holds the flexible track: the editor when shown, otherwise the
+ * chat, otherwise the sidebar — so hiding panes never leaves dead space.
+ */
+function buildCols(l) {
+  const cols = []
+  if (l.sidebar) cols.push(l.editor || l.chat ? `${l.sidebarW}px` : 'minmax(0, 1fr)')
+  if (l.sidebar && (l.editor || l.chat)) cols.push('5px')
+  if (l.editor) cols.push('minmax(0, 1fr)')
+  if (l.editor && l.chat) cols.push('5px')
+  if (l.chat) cols.push(l.editor ? `${l.chatW}px` : 'minmax(0, 1fr)')
+  return cols.join(' ')
+}
+
+/** Titlebar glyphs for the three pane toggles. */
+function PaneIcon({ side }) {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
+      <rect x="1" y="1.5" width="12" height="11" rx="2" fill="none" stroke="currentColor" strokeWidth="1.2" />
+      {side === 'left' && <rect x="2.2" y="2.7" width="3.6" height="8.6" rx="1" fill="currentColor" />}
+      {side === 'mid' && <rect x="5.2" y="2.7" width="3.6" height="8.6" rx="1" fill="currentColor" />}
+      {side === 'right' && <rect x="8.2" y="2.7" width="3.6" height="8.6" rx="1" fill="currentColor" />}
+    </svg>
+  )
+}
 
 let keySeq = 0
 const nextKey = () => `k${++keySeq}`
@@ -68,6 +100,61 @@ export default function App() {
   const [permissionMode, setPermissionMode] = useState(
     () => localStorage.getItem(LS_MODE) || 'acceptEdits'
   )
+
+  // Pane visibility and widths; persisted so the arrangement survives restarts.
+  const [layout, setLayout] = useState(() => {
+    try {
+      return { ...DEFAULT_LAYOUT, ...JSON.parse(localStorage.getItem(LS_LAYOUT) || '{}') }
+    } catch {
+      return DEFAULT_LAYOUT
+    }
+  })
+  useEffect(() => {
+    localStorage.setItem(LS_LAYOUT, JSON.stringify(layout))
+  }, [layout])
+
+  const workspaceRef = useRef(null)
+  const layoutRef = useRef(layout)
+  useEffect(() => {
+    layoutRef.current = layout
+  }, [layout])
+  // Live drag state: the grid is written straight to the DOM on pointermove so
+  // a drag costs zero React renders; state (and storage) update once on release.
+  const dragRef = useRef(null)
+
+  const togglePane = useCallback((name) => {
+    setLayout((prev) => {
+      const next = { ...prev, [name]: !prev[name] }
+      // never allow an empty window
+      if (!next.sidebar && !next.editor && !next.chat) return prev
+      return next
+    })
+  }, [])
+
+  const startPaneDrag = (key) => (e) => {
+    e.preventDefault()
+    dragRef.current = { key, startX: e.clientX, startW: layoutRef.current[key], pending: layoutRef.current[key] }
+    e.currentTarget.setPointerCapture(e.pointerId)
+    workspaceRef.current?.classList.add('is-resizing')
+  }
+  const onPaneDrag = (e) => {
+    const d = dragRef.current
+    if (!d) return
+    const dx = e.clientX - d.startX
+    const raw = d.key === 'sidebarW' ? d.startW + dx : d.startW - dx
+    const [lo, hi] = PANE_BOUNDS[d.key]
+    d.pending = Math.min(hi, Math.max(lo, raw))
+    if (workspaceRef.current) {
+      workspaceRef.current.style.gridTemplateColumns = buildCols({ ...layoutRef.current, [d.key]: d.pending })
+    }
+  }
+  const endPaneDrag = () => {
+    const d = dragRef.current
+    if (!d) return
+    dragRef.current = null
+    workspaceRef.current?.classList.remove('is-resizing')
+    setLayout((prev) => ({ ...prev, [d.key]: d.pending }))
+  }
 
   // Collected during a turn, folded into the finished assistant message.
   const usageRef = useRef(null)
@@ -778,6 +865,18 @@ export default function App() {
         e.preventDefault()
         document.querySelector('.composer-input')?.focus()
       }
+      if (e.key === '1') {
+        e.preventDefault()
+        togglePane('sidebar')
+      }
+      if (e.key === '2') {
+        e.preventDefault()
+        togglePane('editor')
+      }
+      if (e.key === '3') {
+        e.preventDefault()
+        togglePane('chat')
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -804,6 +903,32 @@ export default function App() {
         <span className="titlebar-name">Claude Code</span>
         <span className="titlebar-path">{root || t('titlebar.noFolder')}</span>
         <span className="spacer" />
+        <div className="layout-toggles">
+          <button
+            className="ghost-btn pane-toggle"
+            data-active={layout.sidebar}
+            onClick={() => togglePane('sidebar')}
+            title={t('layout.sidebar')}
+          >
+            <PaneIcon side="left" />
+          </button>
+          <button
+            className="ghost-btn pane-toggle"
+            data-active={layout.editor}
+            onClick={() => togglePane('editor')}
+            title={t('layout.editor')}
+          >
+            <PaneIcon side="mid" />
+          </button>
+          <button
+            className="ghost-btn pane-toggle"
+            data-active={layout.chat}
+            onClick={() => togglePane('chat')}
+            title={t('layout.chat')}
+          >
+            <PaneIcon side="right" />
+          </button>
+        </div>
         <span className={`status-pill status-pill--${busy ? 'busy' : 'idle'}`}>
           {busy
             ? t('status.running')
@@ -813,7 +938,15 @@ export default function App() {
         </span>
       </header>
 
-      <div className="workspace" data-lang={lang}>
+      <div
+        className="workspace"
+        data-lang={lang}
+        ref={workspaceRef}
+        style={{ gridTemplateColumns: buildCols(layout) }}
+        data-hide-sidebar={!layout.sidebar || undefined}
+        data-hide-editor={!layout.editor || undefined}
+        data-hide-chat={!layout.chat || undefined}
+      >
         <Sidebar
           root={root}
           tree={tree}
@@ -839,6 +972,16 @@ export default function App() {
           onDeleteEntry={deleteEntry}
         />
 
+        {layout.sidebar && (layout.editor || layout.chat) && (
+          <div
+            className="pane-divider"
+            onPointerDown={startPaneDrag('sidebarW')}
+            onPointerMove={onPaneDrag}
+            onPointerUp={endPaneDrag}
+            onPointerCancel={endPaneDrag}
+          />
+        )}
+
         <main className="center">
           <EditorPane
             tab={activeTab}
@@ -856,6 +999,16 @@ export default function App() {
             onOpenFile={openFile}
           />
         </main>
+
+        {layout.editor && layout.chat && (
+          <div
+            className="pane-divider"
+            onPointerDown={startPaneDrag('chatW')}
+            onPointerMove={onPaneDrag}
+            onPointerUp={endPaneDrag}
+            onPointerCancel={endPaneDrag}
+          />
+        )}
 
         <ChatPanel
           items={items}
