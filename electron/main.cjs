@@ -1,8 +1,10 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs/promises')
+const fss = require('node:fs')
 const os = require('node:os')
 const { ClaudeAgent } = require('./claude-agent.cjs')
+const store = require('./session-store.cjs')
 
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 
@@ -98,7 +100,126 @@ async function readFileSafe(root, rel) {
     return { content: '', tooLarge: true, truncated: true }
   }
   const content = await fs.readFile(resolved, 'utf8')
-  return { content, truncated: false, tooLarge: false }
+  return { content, truncated: false, tooLarge: false, mtime: stat.mtimeMs }
+}
+
+// ------------------------------------------------------------ write support
+
+/**
+ * Deletions land here rather than in the workspace. A project folder is
+ * usually a git repository, so a .trash directory beside the code would show
+ * up in `git status` and in the file tree; the os temp-style location below a
+ * hidden home directory keeps the workspace pristine while staying recoverable.
+ */
+const TRASH_ROOT = path.join(os.homedir(), '.claude-code-gui', 'trash')
+
+/** Resolve a workspace path, refusing anything that escapes the root. */
+function resolveIn(root, rel) {
+  if (!root) throw new Error('no workspace open')
+  if (typeof rel !== 'string' || !rel.trim()) throw new Error('empty path')
+  const abs = path.isAbsolute(rel) ? rel : path.join(root, rel)
+  const resolved = path.resolve(abs)
+  const rootResolved = path.resolve(root)
+  if (resolved !== rootResolved && !resolved.startsWith(rootResolved + path.sep)) {
+    throw new Error('path escapes workspace')
+  }
+  return resolved
+}
+
+async function writeFileSafe(root, rel, content) {
+  const abs = resolveIn(root, rel)
+  await fs.mkdir(path.dirname(abs), { recursive: true })
+  await fs.writeFile(abs, content, 'utf8')
+  const stat = await fs.stat(abs)
+  return { ok: true, mtime: stat.mtimeMs, size: stat.size }
+}
+
+async function createEntry(root, rel, type) {
+  const abs = resolveIn(root, rel)
+  if (fss.existsSync(abs)) return { ok: false, errorKey: 'err.exists' }
+  if (type === 'dir') {
+    await fs.mkdir(abs, { recursive: true })
+  } else {
+    await fs.mkdir(path.dirname(abs), { recursive: true })
+    await fs.writeFile(abs, '', 'utf8')
+  }
+  return { ok: true, path: rel }
+}
+
+async function renameEntry(root, from, to) {
+  const absFrom = resolveIn(root, from)
+  const absTo = resolveIn(root, to)
+  if (absFrom === absTo) return { ok: true, path: to }
+  if (!fss.existsSync(absFrom)) return { ok: false, errorKey: 'err.notFound' }
+  if (fss.existsSync(absTo)) return { ok: false, errorKey: 'err.exists' }
+  await fs.mkdir(path.dirname(absTo), { recursive: true })
+  await fs.rename(absFrom, absTo)
+  return { ok: true, path: to }
+}
+
+async function deleteEntry(root, rel) {
+  const abs = resolveIn(root, rel)
+  if (!fss.existsSync(abs)) return { ok: false, errorKey: 'err.notFound' }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const dest = path.join(TRASH_ROOT, `${stamp}__${path.basename(abs)}`)
+  await fs.mkdir(TRASH_ROOT, { recursive: true })
+  await fs.rename(abs, dest)
+  return { ok: true, trashPath: dest }
+}
+
+// ---------------------------------------------------------------- watching
+//
+// Claude edits files through the CLI, which the renderer cannot see. Watching
+// the workspace is what makes conflict detection possible: a changed file that
+// has unsaved edits prompts the user instead of being silently overwritten.
+
+const WATCH_IGNORE = /(^|\/)(node_modules|\.git|dist|build|release|\.trash|\.next|__pycache__)(\/|$)/
+const watchers = new Map()
+
+function stopWatch(win) {
+  const entry = watchers.get(win.id)
+  if (entry) {
+    entry.close()
+    watchers.delete(win.id)
+  }
+}
+
+function startWatch(win, root) {
+  stopWatch(win)
+  let timer = null
+  const pending = new Set()
+
+  let watcher
+  try {
+    watcher = fss.watch(root, { recursive: true }, (_event, filename) => {
+      if (!filename) return
+      const rel = String(filename).split(path.sep).join('/')
+      if (WATCH_IGNORE.test(rel)) return
+      pending.add(rel)
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        const paths = [...pending]
+        pending.clear()
+        timer = null
+        send(win, 'fs:changed', { paths })
+      }, 250)
+    })
+  } catch (err) {
+    return { ok: false, errorKey: 'err.watch', detail: err.message }
+  }
+
+  watcher.on('error', () => {})
+  watchers.set(win.id, {
+    close: () => {
+      if (timer) clearTimeout(timer)
+      try {
+        watcher.close()
+      } catch {
+        /* already closed */
+      }
+    },
+  })
+  return { ok: true }
 }
 
 // ------------------------------------------------------------------ ipc setup
@@ -124,10 +245,109 @@ function registerIpc(getWin) {
     }
   })
 
+  // ---------------------------------------------------------- file mutations
+  //
+  // Every one of these resolves the path against the workspace root first, so
+  // an edit can never reach outside the folder the user opened.
+
+  ipcMain.handle('fs:write', async (_e, { root, rel, content }) => {
+    try {
+      return await writeFileSafe(root, rel, content)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.writeFailed', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('fs:create', async (_e, { root, rel, type }) => {
+    try {
+      return await createEntry(root, rel, type)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.createFailed', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('fs:rename', async (_e, { root, from, to }) => {
+    try {
+      return await renameEntry(root, from, to)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.renameFailed', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('fs:delete', async (_e, { root, rel }) => {
+    try {
+      return await deleteEntry(root, rel)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.deleteFailed', detail: err.message }
+    }
+  })
+
+  /** Re-stat a file so an edit can tell whether disk changed underneath it. */
+  ipcMain.handle('fs:stat', async (_e, { root, rel }) => {
+    try {
+      const abs = resolveIn(root, rel)
+      const stat = await fs.stat(abs)
+      return { ok: true, mtime: stat.mtimeMs, size: stat.size }
+    } catch (err) {
+      return { ok: false, errorKey: 'err.notFound', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('fs:watch', async (e, root) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    if (!win || !root) return { ok: false }
+    return startWatch(win, root)
+  })
+
   ipcMain.handle('fs:home', async () => os.homedir())
 
   ipcMain.handle('shell:reveal', async (_e, abs) => {
     shell.showItemInFolder(abs)
+  })
+
+  // ------------------------------------------------- project + session browsing
+  //
+  // These read Claude Code's own state on disk. There is no import step: the
+  // CLI writes ~/.claude/projects, and this is a view onto it.
+
+  ipcMain.handle('projects:list', async (_e, extraPaths) => {
+    try {
+      return { ok: true, projects: await store.listProjects(extraPaths || []) }
+    } catch (err) {
+      return { ok: false, errorKey: 'err.storeRead', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('sessions:list', async (_e, cwd) => {
+    if (!cwd) return { ok: true, sessions: [] }
+    try {
+      return { ok: true, sessions: await store.listSessions(cwd) }
+    } catch (err) {
+      return { ok: false, errorKey: 'err.storeRead', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('sessions:read', async (_e, sessionPath) => {
+    try {
+      return await store.readTranscript(sessionPath)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.storeRead', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('sessions:delete', async (_e, sessionPath) => {
+    try {
+      return await store.deleteSession(sessionPath)
+    } catch (err) {
+      return { ok: false, errorKey: 'err.deleteFailed', detail: err.message }
+    }
+  })
+
+  ipcMain.handle('sessions:reveal', async (_e, sessionPath) => {
+    const abs = store.resolveSessionPath(sessionPath)
+    if (!abs) return { ok: false, errorKey: 'err.sessionNotFound' }
+    shell.showItemInFolder(abs)
+    return { ok: true }
   })
 
   ipcMain.handle('agent:start', async (e, opts) => {
@@ -168,34 +388,23 @@ function registerIpc(getWin) {
   })
 
   // Session history lives as JSONL under ~/.claude/projects/<slugified-cwd>/.
+  // Kept for the workspace sidebar: returns the same sessions the manage screen
+  // shows, including the file path so a resumed conversation can be rendered
+  // from its transcript rather than starting blank.
   ipcMain.handle('history:list', async (_e, cwd) => {
-    const slug = String(cwd || '').replace(/[/.]/g, '-')
-    const dir = path.join(os.homedir(), '.claude', 'projects', slug)
-    let files
     try {
-      files = await fs.readdir(dir)
+      const sessions = await store.listSessions(cwd)
+      return sessions.slice(0, 60).map((s) => ({
+        id: s.id,
+        title: s.title,
+        turns: s.turns,
+        mtime: s.mtime,
+        size: s.size,
+        path: s.path,
+      }))
     } catch {
       return []
     }
-    const out = []
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue
-      const abs = path.join(dir, f)
-      try {
-        const stat = await fs.stat(abs)
-        const summary = await summarizeSession(abs)
-        out.push({
-          id: f.replace(/\.jsonl$/, ''),
-          mtime: stat.mtimeMs,
-          size: stat.size,
-          title: summary.title,
-          turns: summary.turns,
-        })
-      } catch {
-        /* skip unreadable */
-      }
-    }
-    return out.sort((a, b) => b.mtime - a.mtime).slice(0, 40)
   })
 }
 

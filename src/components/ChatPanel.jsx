@@ -27,6 +27,8 @@ export default function ChatPanel({
   const scrollRef = useRef(null)
   const taRef = useRef(null)
   const pinnedRef = useRef(true)
+  // True while an IME composition is in flight; see onKeyDown.
+  const composingRef = useRef(false)
 
   const slashCommands = session?.slashCommands || []
 
@@ -64,6 +66,15 @@ export default function ChatPanel({
   }
 
   const onKeyDown = (e) => {
+    // While an IME is composing (Chinese/Japanese/Korean input), Enter confirms
+    // the candidate instead of submitting. Chrome reports it as isComposing,
+    // but Safari fires compositionend before the keydown, leaving isComposing
+    // false — there the keydown carries keyCode 229, so check both. Arrow keys
+    // are also part of candidate selection, so bail out of all handling here.
+    if (e.nativeEvent?.isComposing || e.nativeEvent?.keyCode === 229 || composingRef.current) {
+      return
+    }
+
     if (slashOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
@@ -90,6 +101,18 @@ export default function ChatPanel({
       e.preventDefault()
       submit()
     }
+  }
+
+  const onCompositionStart = () => {
+    composingRef.current = true
+  }
+
+  const onCompositionEnd = () => {
+    // Safari sequences compositionend before the confirming keydown, so clear
+    // the flag on the next tick rather than synchronously.
+    setTimeout(() => {
+      composingRef.current = false
+    }, 0)
   }
 
   const autoGrow = () => {
@@ -215,6 +238,8 @@ export default function ChatPanel({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             spellCheck={false}
           />
           <div className="composer-actions">
@@ -239,7 +264,7 @@ export default function ChatPanel({
 }
 
 /** Segmented EN/中文 toggle — both languages always reachable in one click. */
-function LangSwitch() {
+export function LangSwitch() {
   const { lang, setLang, t } = useI18n()
   return (
     <div className="lang-switch" title={t('lang.title')}>

@@ -148,11 +148,48 @@ async function driveUi() {
     return r.result?.result?.value
   }
 
-  const uiUp = await ev(`!!document.querySelector('.app') && !!document.querySelector('.composer-input')`)
+  // The app opens on the manage screen; the workspace appears once a session
+  // starts. Poll rather than sampling once: the devtools endpoint answers
+  // before React's first paint, so a single check races the initial render.
+  let uiUp = false
+  for (let i = 0; i < 30; i++) {
+    uiUp = await ev(
+      `!!document.querySelector('.app') && (!!document.querySelector('.home') || !!document.querySelector('.composer-input'))`
+    )
+    if (uiUp) break
+    await sleep(500)
+  }
 
-  // Drive a real turn through the packaged app's own IPC.
-  await ev(`window.api.startAgent({cwd:'${root}', permissionMode:'acceptEdits'})`, true)
-  await sleep(1500)
+  // Navigate the way a user does: pick the project, then open it in the
+  // workspace. Calling startAgent over IPC alone would leave the renderer on
+  // the manage screen, so no transcript would ever render.
+  const rootJson = JSON.stringify(root)
+  const picked = await ev(`(() => {
+    const row = [...document.querySelectorAll('.proj-row')]
+      .find(r => r.getAttribute('title') === ${rootJson});
+    if (row) row.click();
+    return !!row;
+  })()`)
+  await sleep(2500)
+
+  const opened = await ev(`(() => {
+    const b = document.querySelector('.home-proj-actions .send-btn');
+    if (b) b.click();
+    return !!b;
+  })()`)
+
+  // Fall back to the IPC path if the project is not in the list (a folder with
+  // no transcript yet would not have a row).
+  if (!picked || !opened) {
+    await ev(`window.api.startAgent({cwd:${rootJson}, permissionMode:'acceptEdits'})`, true)
+  }
+
+  // Wait for the composer, then send through the app's own IPC.
+  for (let i = 0; i < 20; i++) {
+    if (await ev(`!!document.querySelector('.composer-input')`)) break
+    await sleep(500)
+  }
+  await sleep(1000)
   await ev(`window.api.sendMessage({text:'Reply with exactly the word PACKAGED and nothing else.'})`, true)
 
   let reply = ''
@@ -163,15 +200,33 @@ async function driveUi() {
     if (reply && !busy) break
   }
 
-  const notices = await ev(`JSON.stringify([...document.querySelectorAll('.notice')].map(n=>n.textContent))`)
+  const notices = await ev(`JSON.stringify([...document.querySelectorAll('.notice')].map(n => n.textContent))`)
+  // The manage screen must also be reachable in the shipped bundle. Presence is
+  // not enough: the button lives in the window drag region, where Chromium
+  // routes mousedown to the window manager instead of the page, so a control
+  // that never opted out of the drag region renders fine and is still dead to
+  // real clicks. Assert the property that decides whether it can be clicked.
+  const manage = await ev(`(() => {
+    const b = document.querySelector('.titlebar-manage')
+    if (!b) return JSON.stringify({ present: false })
+    const own = getComputedStyle(b).webkitAppRegion
+    return JSON.stringify({ present: true, region: own })
+  })()`)
+  const manageState = JSON.parse(manage || '{"present":false}')
+  const manageOk = !!manageState.present && manageState.region === 'no-drag'
   ws.close()
-  return { ok: true, uiUp, reply, notices }
+  return { ok: true, uiUp, reply, notices, manageOk, manageState }
 }
 
 const result = await driveUi()
 
 check('window rendered', !!result.uiUp)
 check('claude responded in packaged app', /PACKAGED/.test(result.reply || ''), (result.reply || '').trim().slice(0, 80))
+check(
+  'manage button is clickable (not swallowed by the window drag region)',
+  !!result.manageOk,
+  result.manageState ? `present=${result.manageState.present} app-region=${result.manageState.region}` : ''
+)
 
 if (result.notices && result.notices !== '[]') {
   console.log('  notices: ' + result.notices)

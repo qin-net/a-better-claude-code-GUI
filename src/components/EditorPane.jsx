@@ -1,52 +1,59 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import CodeEditor from './CodeEditor.jsx'
 import { basename, langForExt } from '../lib/format.js'
 import { useI18n } from '../lib/i18n.jsx'
 
-export default function EditorPane({ tab, tabs, activeTab, onSelectTab, onCloseTab, root, changedPaths }) {
+/** Map a file extension onto a Monaco language id where they differ. */
+const LANG_OVERRIDE = {
+  bash: 'shell',
+  zsh: 'shell',
+  sh: 'shell',
+  jsx: 'javascript',
+  tsx: 'typescript',
+  vue: 'html',
+  svelte: 'html',
+}
+
+function monacoLang(ext) {
+  const e = String(ext || '').toLowerCase()
+  return LANG_OVERRIDE[e] || langForExt(e) || 'plaintext'
+}
+
+export default function EditorPane({
+  tab,
+  tabs,
+  activeTab,
+  onSelectTab,
+  onCloseTab,
+  buffers,
+  conflicts,
+  onDirty,
+  onSave,
+  onResolveConflict,
+  onOpenFile,
+}) {
   const { t } = useI18n()
-  const [state, setState] = useState({ loading: false, content: '', error: '', truncated: false, tooLarge: false })
-  const [wrap, setWrap] = useState(false)
-  const [query, setQuery] = useState('')
-  const [showFind, setShowFind] = useState(false)
-  const bodyRef = useRef(null)
+  const [saving, setSaving] = useState(false)
+  const [flash, setFlash] = useState('')
+
+  const buffer = tab ? buffers[tab] : null
+  const conflict = tab ? conflicts[tab] : null
+  const dirty = !!buffer && buffer.content !== buffer.saved
+  const ext = useMemo(() => tab?.split('.').pop(), [tab])
 
   useEffect(() => {
-    if (!tab || !root) return
-    let cancelled = false
-    setState({ loading: true, content: '', error: '', truncated: false, tooLarge: false })
-    window.api.readFile(root, tab).then((res) => {
-      if (cancelled) return
-      if (res.ok) {
-        setState({
-          loading: false,
-          content: res.content,
-          error: '',
-          truncated: res.truncated,
-          tooLarge: !!res.tooLarge,
-        })
-      } else {
-        setState({ loading: false, content: '', error: res.error, truncated: false, tooLarge: false })
-      }
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [tab, root, changedPaths])
+    if (!flash) return
+    const id = setTimeout(() => setFlash(''), 1800)
+    return () => clearTimeout(id)
+  }, [flash])
 
-  const lines = useMemo(() => state.content.split('\n'), [state.content])
-
-  const matchIndex = useMemo(() => {
-    if (!query.trim()) return -1
-    return lines.findIndex((l) => l.includes(query))
-  }, [lines, query])
-
-  useEffect(() => {
-    if (matchIndex < 0 || !bodyRef.current) return
-    const row = bodyRef.current.querySelector(`[data-line="${matchIndex + 1}"]`)
-    row?.scrollIntoView({ block: 'center' })
-  }, [matchIndex])
-
-  const lang = langForExt(tab?.split('.').pop())
+  const requestSave = async () => {
+    if (!tab || !buffer || saving) return
+    setSaving(true)
+    const res = await onSave(tab)
+    setSaving(false)
+    if (res?.ok) setFlash(t('edit.saved', { name: basename(tab) }))
+  }
 
   if (!tab) {
     return (
@@ -63,75 +70,72 @@ export default function EditorPane({ tab, tabs, activeTab, onSelectTab, onCloseT
     <section className="editor">
       <div className="tabbar">
         <div className="tabs">
-          {tabs.map((path) => (
-            <div key={path} className={`tab ${activeTab === path ? 'is-active' : ''}`}>
-              <button className="tab-name" onClick={() => onSelectTab(path)} title={path}>
-                {basename(path)}
-                {changedPaths.has(path) && <span className="tab-modified" />}
-              </button>
-              <button className="tab-close" onClick={() => onCloseTab(path)}>
-                ×
-              </button>
-            </div>
-          ))}
+          {tabs.map((path) => {
+            const b = buffers[path]
+            const isDirty = b && b.content !== b.saved
+            return (
+              <div key={path} className={`tab ${activeTab === path ? 'is-active' : ''}`}>
+                <button className="tab-name" onClick={() => onSelectTab(path)} title={path}>
+                  {basename(path)}
+                  {isDirty && <span className="tab-modified" title={t('edit.dirtyTip')} />}
+                </button>
+                <button className="tab-close" onClick={() => onCloseTab(path)}>
+                  ×
+                </button>
+              </div>
+            )
+          })}
         </div>
         <div className="tabbar-actions">
-          <button className="ghost-btn" onClick={() => setShowFind((v) => !v)} title={t('editor.findTitle')}>
-            {t('editor.find')}
-          </button>
-          <button className="ghost-btn" data-active={wrap} onClick={() => setWrap((v) => !v)} title={t('editor.wrapTitle')}>
-            {t('editor.wrap')}
+          <button
+            className="ghost-btn"
+            data-active={dirty}
+            onClick={requestSave}
+            disabled={!dirty || saving}
+            title={t('edit.saveTitle')}
+          >
+            {dirty ? t('edit.save') : '✓'}
           </button>
         </div>
       </div>
 
       <div className="editor-pathbar">
         <span className="editor-path">{tab}</span>
-        {lang && <span className="editor-lang">{lang}</span>}
+        <span className="editor-lang">{monacoLang(ext)}</span>
         <span className="spacer" />
-        <span className="editor-meta">{t('editor.lines', { n: lines.length })}</span>
+        {dirty && <span className="editor-dirty-flag">{t('edit.unsaved')}</span>}
+        {flash && <span className="editor-flash">{flash}</span>}
       </div>
 
-      {showFind && (
-        <div className="findbar">
-          <input
-            autoFocus
-            className="find-input"
-            placeholder={t('editor.findPlaceholder')}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setShowFind(false)
-            }}
-          />
-          <span className="find-result">
-            {query && matchIndex >= 0
-              ? t('editor.lineN', { n: matchIndex + 1 })
-              : query
-                ? t('editor.noMatch')
-                : ''}
-          </span>
+      {conflict && (
+        <div className="conflict-bar">
+          <span className="conflict-text">⚠ {t('edit.conflict', { name: basename(tab) })}</span>
+          <span className="spacer" />
+          <button className="ghost-btn" onClick={() => onResolveConflict(tab, 'mine')}>
+            {t('edit.keepMine')}
+          </button>
+          <button className="ghost-btn" onClick={() => onResolveConflict(tab, 'disk')}>
+            {t('edit.useDisk')}
+          </button>
         </div>
       )}
 
-      <div className={`editor-body ${wrap ? 'is-wrap' : ''}`} ref={bodyRef}>
-        {state.loading && <div className="editor-status">{t('editor.loading')}</div>}
-        {state.error && <div className="editor-status editor-status--error">{state.error}</div>}
-        {!state.loading && !state.error && !state.tooLarge && (
-          <div className="code-view">
-            {lines.map((line, i) => {
-              const isHit = matchIndex === i
-              return (
-                <div key={i} className={`code-line ${isHit ? 'is-hit' : ''}`} data-line={i + 1}>
-                  <span className="code-gutter">{i + 1}</span>
-                  <span className="code-text">{line || ' '}</span>
-                </div>
-              )
-            })}
-          </div>
+      <div className="editor-body editor-body--mono">
+        {buffer?.tooLarge ? (
+          <div className="editor-status">{t('edit.readOnlyBig')}</div>
+        ) : buffer?.error ? (
+          <div className="editor-status editor-status--error">{buffer.error}</div>
+        ) : buffer ? (
+          <CodeEditor
+            path={tab}
+            content={buffer.content}
+            language={monacoLang(ext)}
+            onChange={(path, value) => onDirty(path, value)}
+            onSaveRequest={() => requestSave()}
+          />
+        ) : (
+          <div className="editor-status">{t('editor.loading')}</div>
         )}
-        {state.tooLarge && <div className="editor-status">{t('err.tooLarge')}</div>}
-        {state.truncated && !state.tooLarge && <div className="editor-status">{t('editor.truncated')}</div>}
       </div>
     </section>
   )

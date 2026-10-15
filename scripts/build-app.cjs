@@ -86,6 +86,47 @@ for (const f of fs.readdirSync(stage, { recursive: true })) {
 
 // ---------------------------------------------------------------- 3. packaging
 
+// The icon is a build input, not a source asset: render it from the script so
+// the .icns never drifts from what make-icon.swift draws. Cache the compiled
+// generator in build/ so repeat builds skip the ~4s swiftc step.
+const iconSrc = path.join(root, 'scripts', 'make-icon.swift')
+const iconGen = path.join(root, 'build', 'make-icon')
+const iconPng = path.join(root, 'build', 'icon.png')
+// Must end in .icns: electron-packager treats any other extension as a raster
+// it has to convert, and silently falls back to the default Electron icon.
+const iconIcns = path.join(root, 'build', 'icon.icns')
+
+function buildIcon() {
+  fs.mkdirSync(path.join(root, 'build'), { recursive: true })
+  if (fs.existsSync(iconIcns) && fs.statSync(iconIcns).mtimeMs >= fs.statSync(iconSrc).mtimeMs) {
+    return iconIcns
+  }
+
+  if (!fs.existsSync(iconGen) || fs.statSync(iconGen).mtimeMs < fs.statSync(iconSrc).mtimeMs) {
+    run('swiftc', ['-O', iconSrc, '-o', iconGen])
+  }
+  run(iconGen, [iconPng])
+
+  const iconset = path.join(root, 'build', 'AppIcon.iconset')
+  rmrf(iconset)
+  fs.mkdirSync(iconset, { recursive: true })
+  const entries = [
+    ['icon_16x16', 16], ['icon_16x16@2x', 32],
+    ['icon_32x32', 32], ['icon_32x32@2x', 64],
+    ['icon_128x128', 128], ['icon_128x128@2x', 256],
+    ['icon_256x256', 256], ['icon_256x256@2x', 512],
+    ['icon_512x512', 512], ['icon_512x512@2x', 1024],
+  ]
+  for (const [name, px] of entries) {
+    run('sips', ['-z', String(px), String(px), iconPng, '--out', path.join(iconset, name + '.png')], { stdio: 'ignore' })
+  }
+  run('iconutil', ['-c', 'icns', iconset, '-o', iconIcns])
+  rmrf(iconset)
+  return iconIcns
+}
+
+const iconPath = buildIcon()
+
 const pkg = require(path.join(root, 'node_modules', '@electron', 'packager', 'package.json'))
 console.log(`\nusing @electron/packager ${pkg.version}`)
 
@@ -100,6 +141,7 @@ run('npx', [
   `--electron-version=${require(path.join(root, 'node_modules', 'electron', 'package.json')).version}`,
   '--app-bundle-id=com.local.claudecode.gui',
   '--app-version=' + rootPkg.version,
+  `--icon=${iconPath}`,
   '--overwrite',
   '--prune=true',
   // Bundle the app into app.asar instead of leaving the sources as loose files
@@ -113,6 +155,17 @@ if (!fs.existsSync(appPath)) {
   console.error('\npackaging finished but the .app was not found at ' + appPath)
   process.exit(1)
 }
+
+// ---------------------------------------------------------------- 4. signing
+//
+// The packager leaves a linker-signed binary while rewriting the bundle, which
+// invalidates the seal: Gatekeeper reports "code has no resources but signature
+// indicates they must be present" and macOS treats the app as damaged. An
+// ad-hoc signature over the finished bundle restores a valid seal so it launches
+// from Finder without a developer certificate.
+console.log('\nsigning (ad-hoc)')
+run('codesign', ['--force', '--deep', '--sign', '-', appPath])
+run('codesign', ['--verify', '--verbose=2', appPath])
 
 console.log('\nbuilt: ' + appPath)
 console.log('\nnext:  npm run verify  (launches it and checks the claude CLI is found)')

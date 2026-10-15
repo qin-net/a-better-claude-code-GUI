@@ -26,6 +26,31 @@ function renderCode(code, lang, labels) {
   return `<div class="md-prewrap"><div class="md-prelabel">${label}<button class="md-copy" data-copy>${escapeHtml(labels.copy)}</button></div><pre class="md-pre"><code>${escapeHtml(code)}</code></pre></div>`
 }
 
+/** Split a table row into cells, tolerating optional leading/trailing pipes. */
+function splitRow(line) {
+  let s = line.trim()
+  if (s.startsWith('|')) s = s.slice(1)
+  if (s.endsWith('|')) s = s.slice(0, -1)
+  return s.split('|').map((c) => c.trim())
+}
+
+/** A GFM delimiter row looks like |---|:--:|---| */
+function isTableDelimiter(line) {
+  if (!line || !line.includes('-')) return false
+  const cells = splitRow(line)
+  return cells.length > 0 && cells.every((c) => /^:?-{1,}:?$/.test(c))
+}
+
+function renderTable(header, rows) {
+  const head = header
+    .map((c) => `<th>${inline(c)}</th>`)
+    .join('')
+  const body = rows
+    .map((r) => `<tr>${r.map((c) => `<td>${inline(c)}</td>`).join('')}</tr>`)
+    .join('')
+  return `<div class="md-table-wrap"><table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`
+}
+
 export function renderMarkdown(src, labels) {
   const L = labels || { copy: 'copy' }
   if (!src) return ''
@@ -69,11 +94,28 @@ export function renderMarkdown(src, labels) {
       continue
     }
 
-    const heading = line.match(/^(#{1,4})\s+(.*)$/)
+    // A table is a header row followed by a |---| delimiter row.
+    if (line.includes('|') && isTableDelimiter(lines[i + 1] || '')) {
+      pushParagraph(para)
+      closeList()
+      const header = splitRow(line)
+      const rows = []
+      i += 2
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitRow(lines[i]))
+        i++
+      }
+      out.push(renderTable(header, rows))
+      continue
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/)
     if (heading) {
       pushParagraph(para)
       closeList()
-      const level = Math.min(heading[1].length + 2, 6)
+      // Keep the transcript outline sensible: a lone # should not outrank the
+      // surrounding UI, so shift down one level and cap at h6.
+      const level = Math.min(heading[1].length + 1, 6)
       out.push(`<h${level}>${inline(heading[2])}</h${level}>`)
       i++
       continue

@@ -12,7 +12,9 @@
     "dev:app": "vite build && electron .",
     "build": "node scripts/build-app.cjs",
     "verify": "node scripts/verify-app.mjs",
-    "release": "node scripts/build-app.cjs && node scripts/verify-app.mjs"
+    "install-app": "node scripts/install-app.cjs",
+    "dist": "node scripts/make-dmg.cjs",
+    "release": "node scripts/build-app.cjs && node scripts/verify-app.mjs && node scripts/install-app.cjs"
   },
   "devDependencies": {
     "@electron/packager": "^18.4.4",
@@ -21,5 +23,8 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "vite": "^5.4.11"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.52.2"
   }
 }

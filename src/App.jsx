@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar.jsx'
 import ChatPanel from './components/ChatPanel.jsx'
 import EditorPane from './components/EditorPane.jsx'
+import HomeView from './components/HomeView.jsx'
 import { useI18n } from './lib/i18n.jsx'
 
 const LS_FOLDER = 'ccgui.lastFolder'
@@ -14,12 +15,21 @@ const nextKey = () => `k${++keySeq}`
 export default function App() {
   const { t, lang } = useI18n()
 
+  // 'home' is the project/session manager; 'ide' is the workspace.
+  const [screen, setScreen] = useState('home')
+
   const [root, setRoot] = useState('')
   const [tree, setTree] = useState([])
   const [view, setView] = useState('files')
 
   const [tabs, setTabs] = useState([])
   const [activeTab, setActiveTab] = useState(null)
+
+  // Open file buffers: rel path -> { content, saved, mtime, tooLarge, error }.
+  // `saved` is what is on disk, so content !== saved means dirty.
+  const [buffers, setBuffers] = useState({})
+  // rel path -> { diskContent } when disk moved under an edited buffer.
+  const [conflicts, setConflicts] = useState({})
 
   const [items, setItems] = useState([])
   const [toolResults, setToolResults] = useState({})
@@ -44,7 +54,14 @@ export default function App() {
   const tRef = useRef(t)
   useEffect(() => {
     tRef.current = t
-  }, [t])
+  }, [])
+
+  // The disk watcher runs for the life of the workspace, so it reads buffers
+  // through a ref instead of re-subscribing on every keystroke.
+  const buffersRef = useRef({})
+  useEffect(() => {
+    buffersRef.current = buffers
+  }, [buffers])
 
   // ------------------------------------------------------------------ helpers
 
@@ -107,9 +124,7 @@ export default function App() {
   }, [model])
   useEffect(() => {
     localStorage.setItem(LS_MODE, permissionMode)
-  }, [permissionMode])
-
-  // ------------------------------------------------------------------- streams
+  }, [permissionMode])  // ------------------------------------------------------------------- streams
 
   useEffect(() => {
     const offEvent = window.api.onEvent((ev) => {
@@ -257,6 +272,45 @@ export default function App() {
     }
   }, [appendItem, loadTree, loadHistory, root])
 
+  // ------------------------------------------------------- external changes
+  //
+  // Claude edits files through the CLI, which would otherwise overwrite an open
+  // buffer without warning. A changed file that has unsaved edits raises a
+  // conflict; one with a clean buffer reloads silently.
+
+  useEffect(() => {
+    const off = window.api.onFsChanged(async ({ paths }) => {
+      if (!root || !paths?.length) return
+
+      for (const rel of paths) {
+        const buf = buffersRef.current[rel]
+        if (!buf || buf.tooLarge) continue
+
+        const res = await window.api.readFile(root, rel)
+        if (!res.ok) continue
+        const diskContent = res.content
+        if (diskContent === buf.saved) continue
+
+        if (buf.content === buf.saved) {
+          // Nothing of mine to lose — take the disk version.
+          setBuffers((prev) =>
+            prev[rel]
+              ? { ...prev, [rel]: { ...prev[rel], content: diskContent, saved: diskContent, mtime: res.mtime } }
+              : prev
+          )
+        } else {
+          setConflicts((prev) => ({ ...prev, [rel]: { diskContent } }))
+        }
+      }
+      loadTree(root)
+    })
+    return off
+  }, [root, loadTree])
+
+  useEffect(() => {
+    if (root && screen === 'ide') window.api.watchWorkspace(root)
+  }, [root, screen])
+
   // ------------------------------------------------------------------ actions
 
   const openFolder = async () => {
@@ -275,18 +329,180 @@ export default function App() {
     await window.api.startAgent({ cwd: dir, model, permissionMode })
   }
 
-  const openFile = useCallback((rel) => {
-    setTabs((prev) => (prev.includes(rel) ? prev : [...prev, rel]))
-    setActiveTab(rel)
+  const openFile = useCallback(
+    async (rel) => {
+      setTabs((prev) => (prev.includes(rel) ? prev : [...prev, rel]))
+      setActiveTab(rel)
+      // Load into a buffer on first open; reopening keeps unsaved work.
+      setBuffers((prev) => {
+        if (prev[rel]) return prev
+        return prev
+      })
+      const res = await window.api.readFile(root, rel)
+      setBuffers((prev) => {
+        if (prev[rel]) return prev
+        if (!res.ok) return { ...prev, [rel]: { content: '', saved: '', error: res.error } }
+        return {
+          ...prev,
+          [rel]: {
+            content: res.content,
+            saved: res.content,
+            mtime: res.mtime,
+            tooLarge: !!res.tooLarge,
+          },
+        }
+      })
+    },
+    [root]
+  )
+
+  const onDirty = useCallback((rel, value) => {
+    setBuffers((prev) => (prev[rel] ? { ...prev, [rel]: { ...prev[rel], content: value } } : prev))
   }, [])
 
-  const closeTab = (rel) => {
+  const saveBuffer = useCallback(
+    async (rel) => {
+      const buf = buffers[rel]
+      if (!buf) return { ok: false }
+      const res = await window.api.writeFile(root, rel, buf.content)
+      if (res.ok) {
+        setBuffers((prev) =>
+          prev[rel]
+            ? { ...prev, [rel]: { ...prev[rel], saved: prev[rel].content, mtime: res.mtime } }
+            : prev
+        )
+        // Saving my version resolves any pending conflict for this file.
+        setConflicts((prev) => {
+          if (!prev[rel]) return prev
+          const next = { ...prev }
+          delete next[rel]
+          return next
+        })
+        loadTree(root)
+      } else if (rel) {
+        appendItem({
+          kind: 'notice',
+          level: 'error',
+          text: describeError(res) || tRef.current('notice.sendFailed'),
+        })
+      }
+      return res
+    },
+    [buffers, root, loadTree, appendItem, describeError]
+  )
+
+  const closeTab = async (rel) => {
+    const buf = buffers[rel]
+    if (buf && buf.content !== buf.saved) {
+      const ok = window.confirm(tRef.current('edit.discardConfirm', { name: rel }))
+      if (!ok) return
+    }
     setTabs((prev) => {
       const next = prev.filter((p) => p !== rel)
       setActiveTab((cur) => (cur === rel ? next[next.length - 1] || null : cur))
       return next
     })
+    setBuffers((prev) => {
+      const next = { ...prev }
+      delete next[rel]
+      return next
+    })
+    setConflicts((prev) => {
+      const next = { ...prev }
+      delete next[rel]
+      return next
+    })
   }
+
+  /** Keep my buffer or take the version now on disk. */
+  const resolveConflict = useCallback((rel, choice) => {
+    setConflicts((prev) => {
+      const entry = prev[rel]
+      if (!entry) return prev
+      if (choice === 'disk') {
+        setBuffers((b) =>
+          b[rel] ? { ...b, [rel]: { ...b[rel], content: entry.diskContent, saved: entry.diskContent } } : b
+        )
+      } else {
+        // Keep mine: adopt disk as the new baseline so the tab stays dirty and
+        // the next save overwrites deliberately.
+        setBuffers((b) => (b[rel] ? { ...b, [rel]: { ...b[rel], saved: entry.diskContent } } : b))
+      }
+      const next = { ...prev }
+      delete next[rel]
+      return next
+    })
+  }, [])
+
+  // ------------------------------------------------- file operations (tree)
+
+  const createEntry = useCallback(
+    async (parentRel, name, type) => {
+      const rel = parentRel ? `${parentRel}/${name}` : name
+      const res = await window.api.createEntry(root, rel, type)
+      if (!res.ok) {
+        appendItem({ kind: 'notice', level: 'error', text: describeError(res) })
+        return { ok: false }
+      }
+      await loadTree(root)
+      if (type === 'file') await openFile(rel)
+      return { ok: true, path: rel }
+    },
+    [root, loadTree, openFile, appendItem, describeError]
+  )
+
+  const renameEntry = useCallback(
+    async (from, name) => {
+      const parent = from.includes('/') ? from.slice(0, from.lastIndexOf('/')) : ''
+      const to = parent ? `${parent}/${name}` : name
+      const res = await window.api.renameEntry(root, from, to)
+      if (!res.ok) {
+        appendItem({ kind: 'notice', level: 'error', text: describeError(res) })
+        return { ok: false }
+      }
+      // Carry the buffer and tab over to the new path.
+      setBuffers((prev) => {
+        if (!prev[from]) return prev
+        const next = { ...prev, [to]: prev[from] }
+        delete next[from]
+        return next
+      })
+      setTabs((prev) => prev.map((p) => (p === from ? to : p)))
+      setActiveTab((cur) => (cur === from ? to : cur))
+      await loadTree(root)
+      return { ok: true, path: to }
+    },
+    [root, loadTree, appendItem, describeError]
+  )
+
+  const deleteEntry = useCallback(
+    async (rel) => {
+      const ok = window.confirm(tRef.current('file.deleteConfirm', { name: rel }))
+      if (!ok) return { ok: false }
+      const res = await window.api.deleteEntry(root, rel)
+      if (!res.ok) {
+        appendItem({ kind: 'notice', level: 'error', text: describeError(res) })
+        return { ok: false }
+      }
+      appendItem({ kind: 'notice', text: tRef.current('file.deleted', { name: rel }) })
+      // Close any tab that lived under the deleted path.
+      setTabs((prev) => {
+        const next = prev.filter((p) => p !== rel && !p.startsWith(rel + '/'))
+        setActiveTab((cur) => (cur && (cur === rel || cur.startsWith(rel + '/')) ? next[next.length - 1] || null : cur))
+        return next
+      })
+      setBuffers((prev) => {
+        const next = { ...prev }
+        for (const p of Object.keys(next)) {
+          if (p === rel || p.startsWith(rel + '/')) delete next[p]
+        }
+        return next
+      })
+      await loadTree(root)
+      return { ok: true }
+    },
+    [root, loadTree, appendItem, describeError]
+  )
 
   const send = async (text) => {
     appendItem({ kind: 'user', text })
@@ -315,17 +531,124 @@ export default function App() {
     await startAgent({})
   }
 
+  /**
+   * Resume a session from the workspace sidebar. Renders its transcript so the
+   * conversation is visible rather than an empty pane, matching the manage
+   * screen's behaviour.
+   */
   const openHistory = async (h) => {
     await window.api.stopAgent()
-    setItems([
-      {
-        kind: 'notice',
-        text: tRef.current('notice.resumed', { id: h.id.slice(0, 8), turns: h.turns }),
-      },
-    ])
-    setToolResults({})
+
+    const notice = {
+      kind: 'notice',
+      text: tRef.current('notice.resumed', { id: h.id.slice(0, 8), turns: h.turns }),
+    }
+
+    let rendered = []
+    let results = {}
+    if (h.path) {
+      const parsed = await window.api.readSession(h.path)
+      if (parsed.ok) {
+        rendered = parsed.items
+        results = parsed.toolResults || {}
+      }
+    }
+
+    setItems([notice, ...rendered])
+    setToolResults(results)
     setBusy(false)
+    setStatus('idle')
+    setSession({
+      sessionId: h.id,
+      model: h.model || '',
+      cwd: root,
+      tools: [],
+      slashCommands: [],
+      version: '',
+      resumed: true,
+    })
+    sessionIdRef.current = h.id
     await startAgent({ resumeId: h.id })
+  }
+
+  /**
+   * Entry point from the manager screen. Opens a folder as the workspace and
+   * resumes the given session, rendering its transcript so the conversation is
+   * not blank on arrival.
+   */
+  const openSessionInIde = async (cwd, sessionId) => {
+    await window.api.stopAgent()
+
+    setRoot(cwd)
+    localStorage.setItem(LS_FOLDER, cwd)
+
+    const recent = (() => {
+      try {
+        return JSON.parse(localStorage.getItem('ccgui.recentFolders') || '[]')
+      } catch {
+        return []
+      }
+    })()
+    localStorage.setItem('ccgui.recentFolders', JSON.stringify([...new Set([...recent, cwd])]))
+
+    setTabs([])
+    setActiveTab(null)
+    setToolResults({})
+    setChangedPaths(new Set())
+    setSession(null)
+    setBusy(false)
+    setStatus('idle')
+
+    if (sessionId) {
+      const res = await window.api.listSessions(cwd)
+      const record = res.ok ? res.sessions.find((s) => s.id === sessionId) : null
+
+      // In --resume mode the CLI emits no init event until the first message of
+      // the turn, so the session header would sit empty. Seed it from what we
+      // already know; a real init overwrites this once the user speaks.
+      setSession({
+        sessionId,
+        model: record?.model || '',
+        cwd,
+        tools: [],
+        slashCommands: [],
+        version: record?.version || '',
+        resumed: true,
+      })
+
+      if (record) {
+        const parsed = await window.api.readSession(record.path)
+        if (parsed.ok) {
+          setItems([
+            {
+              kind: 'notice',
+              text: tRef.current('notice.resumed', {
+                id: sessionId.slice(0, 8),
+                turns: record.turns,
+              }),
+            },
+            ...parsed.items,
+          ])
+          setToolResults(parsed.toolResults || {})
+        } else {
+          setItems([{ kind: 'notice', text: tRef.current('notice.resumed', { id: sessionId.slice(0, 8), turns: 0 }) }])
+        }
+      }
+      sessionIdRef.current = sessionId
+    } else {
+      setItems([])
+    }
+
+    setScreen('ide')
+    loadTree(cwd)
+    loadHistory(cwd)
+
+    await window.api.startAgent({
+      cwd,
+      model,
+      permissionMode,
+      resumeId: sessionId || '',
+    })
   }
 
   // Model / permission changes need a fresh process; resume keeps the history.
@@ -367,9 +690,24 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   })
 
+  if (screen === 'home') {
+    return (
+      <div className="app" data-lang={lang}>
+        <HomeView
+          currentCwd={root}
+          onOpenSession={openSessionInIde}
+          onBackToIde={() => setScreen('ide')}
+        />
+      </div>
+    )
+  }
+
   return (
-    <div className="app">
+    <div className="app" data-lang={lang}>
       <header className="titlebar">
+        <button className="ghost-btn titlebar-manage" onClick={() => setScreen('home')} title={t('home.manage')}>
+          ☰
+        </button>
         <span className="titlebar-name">Claude Code</span>
         <span className="titlebar-path">{root || t('titlebar.noFolder')}</span>
         <span className="spacer" />
@@ -393,6 +731,7 @@ export default function App() {
           changedPaths={changedPaths}
           history={history}
           tabs={tabs}
+          buffers={buffers}
           onOpenFolder={openFolder}
           onOpenFile={openFile}
           onOpenHistory={openHistory}
@@ -402,6 +741,9 @@ export default function App() {
           }}
           onSelectTab={setActiveTab}
           onCloseTab={closeTab}
+          onCreateEntry={createEntry}
+          onRenameEntry={renameEntry}
+          onDeleteEntry={deleteEntry}
         />
 
         <main className="center">
@@ -410,9 +752,15 @@ export default function App() {
             tabs={tabs}
             activeTab={activeTab}
             root={root}
+            buffers={buffers}
+            conflicts={conflicts}
             changedPaths={changedPaths}
+            onDirty={onDirty}
+            onSave={saveBuffer}
+            onResolveConflict={resolveConflict}
             onSelectTab={setActiveTab}
             onCloseTab={closeTab}
+            onOpenFile={openFile}
           />
         </main>
 
