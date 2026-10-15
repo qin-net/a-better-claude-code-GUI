@@ -2,11 +2,11 @@ import { useMemo, useState } from 'react'
 import { renderMarkdown } from '../lib/format.js'
 import { useI18n } from '../lib/i18n.jsx'
 
-export default function Markdown({ text }) {
+export default function Markdown({ text, doc = false }) {
   const { t } = useI18n()
   const html = useMemo(
-    () => renderMarkdown(text, { copy: t('md.copy') }),
-    [text, t]
+    () => renderMarkdown(text, { copy: t('md.copy') }, { shiftHeadings: !doc }),
+    [text, t, doc]
   )
 
   const onClick = (e) => {
@@ -21,7 +21,13 @@ export default function Markdown({ text }) {
     }, 1200)
   }
 
-  return <div className="markdown" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
+  return (
+    <div
+      className={doc ? 'markdown markdown--doc' : 'markdown'}
+      onClick={onClick}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  )
 }
 
 export function CodeBlock({ code, lang, maxLines = 400 }) {

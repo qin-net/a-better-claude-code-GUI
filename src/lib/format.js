@@ -18,6 +18,8 @@ function inline(text) {
     .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    // Images must be rewritten before links, or ![a](url) loses its "!" to the link rule.
+    .replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, '<img class="md-img" src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer"/>')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
 }
 
@@ -51,7 +53,7 @@ function renderTable(header, rows) {
   return `<div class="md-table-wrap"><table class="md-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`
 }
 
-export function renderMarkdown(src, labels) {
+export function renderMarkdown(src, labels, opts = {}) {
   const L = labels || { copy: 'copy' }
   if (!src) return ''
   const text = String(src).replace(/\r\n/g, '\n')
@@ -114,8 +116,11 @@ export function renderMarkdown(src, labels) {
       pushParagraph(para)
       closeList()
       // Keep the transcript outline sensible: a lone # should not outrank the
-      // surrounding UI, so shift down one level and cap at h6.
-      const level = Math.min(heading[1].length + 1, 6)
+      // surrounding UI, so shift down one level and cap at h6. Document views
+      // (README preview) pass shiftHeadings: false to keep the real levels.
+      const level = opts.shiftHeadings === false
+        ? heading[1].length
+        : Math.min(heading[1].length + 1, 6)
       out.push(`<h${level}>${inline(heading[2])}</h${level}>`)
       i++
       continue

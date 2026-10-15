@@ -86,6 +86,10 @@ const en = {
   'editor.noMatch': 'no match',
   'editor.loading': 'loading…',
   'editor.truncated': 'preview truncated',
+  'editor.preview': 'preview',
+  'editor.split': 'split',
+  'editor.source': 'source',
+  'editor.previewTitle': 'Markdown view: source, side-by-side, or rendered preview',
 
   // messages
   'msg.thinking': 'Thinking…',
@@ -299,6 +303,10 @@ const zh = {
   'editor.noMatch': '无匹配',
   'editor.loading': '加载中…',
   'editor.truncated': '预览已截断',
+  'editor.preview': '预览',
+  'editor.split': '对照',
+  'editor.source': '源码',
+  'editor.previewTitle': 'Markdown 视图：源码 / 左右对照 / 渲染预览',
 
   'msg.thinking': '思考中…',
   'msg.thought': '已思考',

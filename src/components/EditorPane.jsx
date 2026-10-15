@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import CodeEditor from './CodeEditor.jsx'
+import Markdown from './Markdown.jsx'
 import { basename, langForExt } from '../lib/format.js'
 import { useI18n } from '../lib/i18n.jsx'
 
@@ -35,11 +36,17 @@ export default function EditorPane({
   const { t } = useI18n()
   const [saving, setSaving] = useState(false)
   const [flash, setFlash] = useState('')
+  // View preference per tab path: 'source' | 'split' | 'preview'. Markdown
+  // opens as source; the segmented buttons render it on demand.
+  const [viewModes, setViewModes] = useState({})
 
   const buffer = tab ? buffers[tab] : null
   const conflict = tab ? conflicts[tab] : null
   const dirty = !!buffer && buffer.content !== buffer.saved
   const ext = useMemo(() => tab?.split('.').pop(), [tab])
+  const isMd = /^(md|markdown)$/i.test(ext || '')
+  const mode = isMd ? viewModes[tab] ?? 'source' : 'source'
+  const setMode = (next) => setViewModes((m) => ({ ...m, [tab]: next }))
 
   useEffect(() => {
     if (!flash) return
@@ -87,6 +94,20 @@ export default function EditorPane({
           })}
         </div>
         <div className="tabbar-actions">
+          {isMd && (
+            <span className="view-seg" title={t('editor.previewTitle')}>
+              {['source', 'split', 'preview'].map((m) => (
+                <button
+                  key={m}
+                  className="ghost-btn"
+                  data-active={mode === m}
+                  onClick={() => setMode(m)}
+                >
+                  {t(`editor.${m}`)}
+                </button>
+              ))}
+            </span>
+          )}
           <button
             className="ghost-btn"
             data-active={dirty}
@@ -101,7 +122,7 @@ export default function EditorPane({
 
       <div className="editor-pathbar">
         <span className="editor-path">{tab}</span>
-        <span className="editor-lang">{monacoLang(ext)}</span>
+        <span className="editor-lang">{mode === 'source' ? monacoLang(ext) : t(`editor.${mode}`)}</span>
         <span className="spacer" />
         {dirty && <span className="editor-dirty-flag">{t('edit.unsaved')}</span>}
         {flash && <span className="editor-flash">{flash}</span>}
@@ -120,12 +141,35 @@ export default function EditorPane({
         </div>
       )}
 
-      <div className="editor-body editor-body--mono">
+      <div
+        className={`editor-body ${
+          mode === 'preview' ? 'editor-body--doc' : mode === 'split' ? 'editor-body--split' : 'editor-body--mono'
+        }`}
+      >
         {buffer?.tooLarge ? (
           <div className="editor-status">{t('edit.readOnlyBig')}</div>
         ) : buffer?.error ? (
           <div className="editor-status editor-status--error">{buffer.error}</div>
-        ) : buffer ? (
+        ) : !buffer ? (
+          <div className="editor-status">{t('editor.loading')}</div>
+        ) : mode === 'preview' ? (
+          <Markdown text={buffer.content} doc />
+        ) : mode === 'split' ? (
+          <>
+            <div className="split-code">
+              <CodeEditor
+                path={tab}
+                content={buffer.content}
+                language={monacoLang(ext)}
+                onChange={(path, value) => onDirty(path, value)}
+                onSaveRequest={() => requestSave()}
+              />
+            </div>
+            <div className="split-doc">
+              <Markdown text={buffer.content} doc />
+            </div>
+          </>
+        ) : (
           <CodeEditor
             path={tab}
             content={buffer.content}
@@ -133,8 +177,6 @@ export default function EditorPane({
             onChange={(path, value) => onDirty(path, value)}
             onSaveRequest={() => requestSave()}
           />
-        ) : (
-          <div className="editor-status">{t('editor.loading')}</div>
         )}
       </div>
     </section>
