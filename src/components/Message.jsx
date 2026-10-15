@@ -1,7 +1,7 @@
-import { useState } from 'react'
-import Markdown, { CodeBlock } from './Markdown.jsx'
+import { memo, useState } from 'react'
+import Markdown from './Markdown.jsx'
 import ToolCard from './ToolCard.jsx'
-import { formatCost, formatDuration, formatTokens } from '../lib/format.js'
+import { formatCost, formatDuration, formatTokens, toolSummary } from '../lib/format.js'
 import { useI18n } from '../lib/i18n.jsx'
 
 function ThinkingBlock({ text, running }) {
@@ -76,24 +76,80 @@ function ResultCard({ item }) {
   )
 }
 
-function Blocks({ blocks, toolResults, root, onOpenFile, streaming }) {
+/**
+ * A permission ask from the CLI. Pending shows 允许/总是允许/拒绝; once decided
+ * (or auto-allowed by a session rule, or orphaned by a process restart) the
+ * card keeps a record of what happened.
+ */
+function PermissionCard({ item, onDecide }) {
+  const { t } = useI18n()
+  const summary = toolSummary(item.tool, item.input || {}, t)
+  const detailRaw =
+    item.input?.command ||
+    item.input?.file_path ||
+    item.input?.url ||
+    ''
+  // toolSummary for Bash already is the command — don't print it twice.
+  const detail = String(detailRaw) === String(summary) ? '' : detailRaw
+
+  const badge = {
+    allowed: t('perm.allowed'),
+    denied: t('perm.denied'),
+    auto: t('perm.auto'),
+    cancelled: t('perm.cancelled'),
+  }[item.status]
+
+  return (
+    <div className={`perm-card perm-card--${item.status}`}>
+      <div className="perm-head">
+        <span className="perm-icon">⚿</span>
+        <span className="perm-title">{t('perm.title')}</span>
+        <span className="perm-tool">{item.tool}</span>
+        {badge && <span className={`perm-badge perm-badge--${item.status}`}>{badge}</span>}
+      </div>
+      <div className="perm-summary">{summary}</div>
+      {detail && <pre className="perm-detail">{String(detail).slice(0, 600)}</pre>}
+      {item.status === 'pending' && (
+        <div className="perm-actions">
+          <button className="perm-btn perm-btn--allow" onClick={() => onDecide(item, 'allow')}>
+            {t('perm.allow')}
+          </button>
+          <button className="perm-btn" onClick={() => onDecide(item, 'always')}>
+            {t('perm.allowAlways')}
+          </button>
+          <button className="perm-btn perm-btn--deny" onClick={() => onDecide(item, 'deny')}>
+            {t('perm.deny')}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Blocks({ blocks, results, root, onOpenFile, streaming, liveFrom }) {
   return (
     <>
       {blocks.map((b, i) => {
+        // Blocks still streaming render as plain text: re-parsing the whole
+        // accumulated markdown and swapping the block's innerHTML every flush
+        // is what made long answers progressively slower. The finished block
+        // arrives via a 'block' event and gets the full renderer.
+        const live = streaming && i >= liveFrom
         if (b.type === 'text') {
           if (!b.text) return null
+          if (live) return <div key={`t${i}`} className="md-live">{b.text}</div>
           return <Markdown key={`t${i}`} text={b.text} />
         }
         if (b.type === 'thinking') {
           if (!b.thinking) return null
-          return <ThinkingBlock key={`k${i}`} text={b.thinking} running={streaming && i === blocks.length - 1} />
+          return <ThinkingBlock key={`k${i}`} text={b.thinking} running={live && i === blocks.length - 1} />
         }
         if (b.type === 'tool_use') {
           return (
             <ToolCard
               key={b.id || `u${i}`}
               block={b}
-              result={toolResults[b.id]}
+              result={results ? results[b.id] : undefined}
               root={root}
               onOpenFile={onOpenFile}
             />
@@ -105,12 +161,16 @@ function Blocks({ blocks, toolResults, root, onOpenFile, streaming }) {
   )
 }
 
-export default function Turn({ item, toolResults, root, onOpenFile }) {
+function Turn({ item, root, onOpenFile, onPermissionDecision }) {
   const { t } = useI18n()
 
   if (item.kind === 'user') return <UserMessage item={item} />
 
   if (item.kind === 'result') return <ResultCard item={item} />
+
+  if (item.kind === 'permission') {
+    return <PermissionCard item={item} onDecide={onPermissionDecision} />
+  }
 
   if (item.kind === 'notice') {
     return (
@@ -126,10 +186,11 @@ export default function Turn({ item, toolResults, root, onOpenFile }) {
     <div className="turn turn--assistant">
       <Blocks
         blocks={item.blocks}
-        toolResults={toolResults}
+        results={item.results}
         root={root}
         onOpenFile={onOpenFile}
         streaming={item.streaming}
+        liveFrom={item.finalized || 0}
       />
       {item.streaming && <span className="caret" />}
       {item.collapsedCount > 0 && (
@@ -138,3 +199,9 @@ export default function Turn({ item, toolResults, root, onOpenFile }) {
     </div>
   )
 }
+
+// During streaming and typing, every row except the one being written to keeps
+// identical props — memo turns the per-update render cost from O(conversation)
+// into O(1). Item objects are replaced (never mutated) by App, so the default
+// shallow compare is exactly right.
+export default memo(Turn)

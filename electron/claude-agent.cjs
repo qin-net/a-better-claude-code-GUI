@@ -27,6 +27,10 @@ class ClaudeAgent {
     this.sessionId = this.resumeId || ''
     this.busy = false
 
+    // requestId -> original control_request, for permission asks awaiting the
+    // user's decision in the renderer.
+    this.pendingAsks = new Map()
+
     // streaming accumulation
     this.blocks = new Map()   // index -> block
     this.dirty = false
@@ -42,6 +46,10 @@ class ClaudeAgent {
       '--output-format', 'stream-json',
       '--verbose',
       '--include-partial-messages',
+      // Route permission prompts to us over stdio as control_request records.
+      // Without this the CLI has nobody to ask, so anything needing approval is
+      // denied silently and only shows up afterwards in permission_denials.
+      '--permission-prompt-tool', 'stdio',
     ]
     if (this.model) args.push('--model', this.model)
     if (this.permissionMode) args.push('--permission-mode', this.permissionMode)
@@ -79,6 +87,12 @@ class ClaudeAgent {
       if (this.proc === proc) this.proc = null
       this.flush()
       this.busy = false
+      // Any ask still waiting on the user dies with the process; tell the
+      // renderer so pending cards do not sit unanswerable forever.
+      for (const requestId of this.pendingAsks.keys()) {
+        this.onEvent({ kind: 'permission_cancelled', requestId })
+      }
+      this.pendingAsks.clear()
       this.onEvent({ kind: 'status', state: 'stopped' })
       this.onExit({ code, signal, sessionId: this.sessionId, intentional: proc._intentional })
     })
@@ -175,10 +189,7 @@ class ClaudeAgent {
       case 'stream_event':
         return this.handleStreamEvent(rec.event)
       case 'control_request':
-        // Nothing is expected here in --print mode, but never let the CLI
-        // block waiting on a reply.
-        this.replyControl(rec)
-        return
+        return this.handleControlRequest(rec)
       default:
         return
     }
@@ -324,17 +335,46 @@ class ClaudeAgent {
       .join('\n')
   }
 
-  replyControl(rec) {
-    if (!this.proc || !rec.request_id) return
+  /**
+   * can_use_tool asks go to the renderer and wait for the user; everything
+   * else gets an empty success ack so the CLI never blocks on us.
+   */
+  handleControlRequest(rec) {
+    if (!rec.request_id) return
+    if (rec.request?.subtype === 'can_use_tool') {
+      this.pendingAsks.set(rec.request_id, rec)
+      this.onEvent({
+        kind: 'permission_request',
+        requestId: rec.request_id,
+        tool: rec.request.tool_name || '',
+        input: rec.request.input || {},
+        suggestions: rec.request.permission_suggestions || [],
+      })
+      return
+    }
+    this.writeControlResponse(rec.request_id, {})
+  }
+
+  /**
+   * The renderer's verdict on a pending ask.
+   * decision: { behavior: 'allow' } or { behavior: 'deny', message }.
+   */
+  respondPermission({ requestId, behavior, message }) {
+    const rec = this.pendingAsks.get(requestId)
+    if (!rec) return { ok: false, errorKey: 'err.askExpired' }
+    this.pendingAsks.delete(requestId)
+    const response = behavior === 'allow'
+      ? { behavior: 'allow', updatedInput: rec.request?.input || {} }
+      : { behavior: 'deny', message: message || 'The user declined this tool use.' }
+    this.writeControlResponse(requestId, response)
+    return { ok: true }
+  }
+
+  writeControlResponse(requestId, response) {
+    if (!this.proc) return
     const reply = {
       type: 'control_response',
-      response: {
-        subtype: 'success',
-        request_id: rec.request_id,
-        response: rec.request?.subtype === 'can_use_tool'
-          ? { behavior: 'allow', updatedInput: rec.request.input }
-          : {},
-      },
+      response: { subtype: 'success', request_id: requestId, response },
     }
     try {
       this.proc.stdin.write(JSON.stringify(reply) + '\n')

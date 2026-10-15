@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('api', {
   sendMessage: (payload) => ipcRenderer.invoke('agent:send', payload),
   stopAgent: () => ipcRenderer.invoke('agent:stop'),
   interruptAgent: () => ipcRenderer.invoke('agent:interrupt'),
+  respondPermission: (payload) => ipcRenderer.invoke('agent:permission', payload),
 
   listHistory: (cwd) => ipcRenderer.invoke('history:list', cwd),
 

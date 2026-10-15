@@ -387,6 +387,14 @@ function registerIpc(getWin) {
     return { ok: true }
   })
 
+  /** The user's verdict on a pending permission ask. */
+  ipcMain.handle('agent:permission', async (e, payload) => {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    const agent = win && agents.get(win.id)
+    if (!agent) return { ok: false, errorKey: 'err.agentNotStarted' }
+    return agent.respondPermission(payload || {})
+  })
+
   // Session history lives as JSONL under ~/.claude/projects/<slugified-cwd>/.
   // Kept for the workspace sidebar: returns the same sessions the manage screen
   // shows, including the file path so a resumed conversation can be rendered

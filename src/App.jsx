@@ -11,6 +11,28 @@ const LS_MODE = 'ccgui.permissionMode'
 
 let keySeq = 0
 const nextKey = () => `k${++keySeq}`
+const withKeys = (list) => list.map((it) => ({ key: nextKey(), ...it }))
+
+/**
+ * Fold a transcript's toolUseId -> result map into the items that own the
+ * matching tool_use blocks. Results living on the item (instead of one global
+ * map passed to every row) is what lets rows be memoized: a result arriving
+ * changes exactly one item's identity.
+ */
+function attachResults(list, results) {
+  if (!results) return list
+  return list.map((it) => {
+    if (it.kind !== 'assistant' || !it.blocks) return it
+    let own = null
+    for (const b of it.blocks) {
+      if (b.type === 'tool_use' && results[b.id]) {
+        own = own || {}
+        own[b.id] = results[b.id]
+      }
+    }
+    return own ? { ...it, results: own } : it
+  })
+}
 
 export default function App() {
   const { t, lang } = useI18n()
@@ -32,8 +54,10 @@ export default function App() {
   const [conflicts, setConflicts] = useState({})
 
   const [items, setItems] = useState([])
-  const [toolResults, setToolResults] = useState({})
   const [changedPaths, setChangedPaths] = useState(() => new Set())
+
+  // Tools the user chose "always allow" for during this session.
+  const autoAllowRef = useRef(new Set())
 
   const [session, setSession] = useState(null)
   const [busy, setBusy] = useState(false)
@@ -183,10 +207,59 @@ export default function App() {
           break
         }
         case 'tool_result': {
-          setToolResults((prev) => ({
-            ...prev,
-            [ev.toolUseId]: { content: ev.content, isError: ev.isError },
-          }))
+          // Attach the result to the item that owns the tool_use block, so only
+          // that row's identity changes and every other row stays memoized.
+          setItems((prev) => {
+            for (let i = prev.length - 1; i >= 0; i--) {
+              const it = prev[i]
+              if (
+                it.kind === 'assistant' &&
+                it.blocks?.some((b) => b.type === 'tool_use' && b.id === ev.toolUseId)
+              ) {
+                const next = prev.slice()
+                next[i] = {
+                  ...it,
+                  results: {
+                    ...(it.results || {}),
+                    [ev.toolUseId]: { content: ev.content, isError: ev.isError },
+                  },
+                }
+                return next
+              }
+            }
+            return prev
+          })
+          break
+        }
+        case 'permission_request': {
+          if (autoAllowRef.current.has(ev.tool)) {
+            window.api.respondPermission({ requestId: ev.requestId, behavior: 'allow' })
+            appendItem({
+              kind: 'permission',
+              requestId: ev.requestId,
+              tool: ev.tool,
+              input: ev.input,
+              status: 'auto',
+            })
+          } else {
+            appendItem({
+              kind: 'permission',
+              requestId: ev.requestId,
+              tool: ev.tool,
+              input: ev.input,
+              status: 'pending',
+            })
+          }
+          break
+        }
+        case 'permission_cancelled': {
+          setItems((prev) =>
+            prev.map((it) =>
+              it.kind === 'permission' && it.requestId === ev.requestId && it.status === 'pending'
+                ? { ...it, status: 'cancelled' }
+                : it
+            )
+          )
           break
         }
         case 'usage': {
@@ -217,6 +290,12 @@ export default function App() {
               level: 'error',
               text: tr('notice.permissionDenied', { tool: d.tool_name || tr('notice.aTool') }),
             })
+          }
+          // The relay's "model not allowed / has no valid services" 400 is a
+          // transient upstream outage, not a key permission problem — say so
+          // instead of leaking the raw gateway error.
+          if (ev.isError && /该key不允许访问该模型|has no valid services/i.test(ev.result || '')) {
+            appendItem({ kind: 'notice', level: 'error', text: tr('notice.relayFlaky') })
           }
           setBusy(false)
           setStatus('idle')
@@ -319,7 +398,6 @@ export default function App() {
     setRoot(dir)
     localStorage.setItem(LS_FOLDER, dir)
     setItems([])
-    setToolResults({})
     setChangedPaths(new Set())
     setSession(null)
     setTabs([])
@@ -358,6 +436,23 @@ export default function App() {
 
   const onDirty = useCallback((rel, value) => {
     setBuffers((prev) => (prev[rel] ? { ...prev, [rel]: { ...prev[rel], content: value } } : prev))
+  }, [])
+
+  /**
+   * The user's verdict on a permission card.
+   * action: 'allow' | 'always' (allow + remember the tool for this session) | 'deny'.
+   */
+  const decidePermission = useCallback(async (item, action) => {
+    if (action === 'always') autoAllowRef.current.add(item.tool)
+    const behavior = action === 'deny' ? 'deny' : 'allow'
+    const res = await window.api.respondPermission({ requestId: item.requestId, behavior })
+    setItems((prev) =>
+      prev.map((it) =>
+        it.kind === 'permission' && it.requestId === item.requestId
+          ? { ...it, status: res?.ok ? (behavior === 'allow' ? 'allowed' : 'denied') : 'cancelled' }
+          : it
+      )
+    )
   }, [])
 
   const saveBuffer = useCallback(
@@ -523,7 +618,6 @@ export default function App() {
   const newSession = async () => {
     await window.api.stopAgent()
     setItems([])
-    setToolResults({})
     setChangedPaths(new Set())
     setSession(null)
     setBusy(false)
@@ -554,8 +648,7 @@ export default function App() {
       }
     }
 
-    setItems([notice, ...rendered])
-    setToolResults(results)
+    setItems(withKeys([notice, ...attachResults(rendered, results)]))
     setBusy(false)
     setStatus('idle')
     setSession({
@@ -593,7 +686,6 @@ export default function App() {
 
     setTabs([])
     setActiveTab(null)
-    setToolResults({})
     setChangedPaths(new Set())
     setSession(null)
     setBusy(false)
@@ -619,19 +711,20 @@ export default function App() {
       if (record) {
         const parsed = await window.api.readSession(record.path)
         if (parsed.ok) {
-          setItems([
-            {
-              kind: 'notice',
-              text: tRef.current('notice.resumed', {
-                id: sessionId.slice(0, 8),
-                turns: record.turns,
-              }),
-            },
-            ...parsed.items,
-          ])
-          setToolResults(parsed.toolResults || {})
+          setItems(
+            withKeys([
+              {
+                kind: 'notice',
+                text: tRef.current('notice.resumed', {
+                  id: sessionId.slice(0, 8),
+                  turns: record.turns,
+                }),
+              },
+              ...attachResults(parsed.items, parsed.toolResults),
+            ])
+          )
         } else {
-          setItems([{ kind: 'notice', text: tRef.current('notice.resumed', { id: sessionId.slice(0, 8), turns: 0 }) }])
+          setItems(withKeys([{ kind: 'notice', text: tRef.current('notice.resumed', { id: sessionId.slice(0, 8), turns: 0 }) }]))
         }
       }
       sessionIdRef.current = sessionId
@@ -766,7 +859,6 @@ export default function App() {
 
         <ChatPanel
           items={items}
-          toolResults={toolResults}
           root={root}
           busy={busy}
           status={status}
@@ -779,6 +871,7 @@ export default function App() {
           onInterrupt={interrupt}
           onOpenFile={openFile}
           onNewSession={newSession}
+          onPermissionDecision={decidePermission}
         />
       </div>
     </div>
